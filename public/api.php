@@ -1,134 +1,139 @@
 <?php
-/**
- * Bot → dashboard API
- * POST /api.php?key=DASH_API_KEY
- * JSON body: {action: claim|fail|status|heartbeat, site, username, ...}
- */
+declare(strict_types=1);
+
+/** Bot -> PickDash API. POST /api.php?key=... or X-API-Key header. */
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
+header('Cache-Control: no-store');
+header('X-Content-Type-Options: nosniff');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, X-API-Key');
 
-require_once __DIR__ . '/../lib/Database.php';
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
 
-$apiKey = getenv('DASH_API_KEY') ?: 'pickdash-secret-change-me';
-$got = $_GET['key'] ?? ($_SERVER['HTTP_X_API_KEY'] ?? '');
-if (!hash_equals($apiKey, (string)$got)) {
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
+$databaseFile = is_file(__DIR__ . '/lib/Database.php')
+    ? __DIR__ . '/lib/Database.php'
+    : __DIR__ . '/../lib/Database.php';
+require_once $databaseFile;
+
+$apiKey = trim((string)getenv('DASH_API_KEY'));
+if ($apiKey === '') {
+    error_log('[PickDash api.php] DASH_API_KEY is not configured.');
+    http_response_code(503);
+    echo json_encode(['ok' => false, 'error' => 'API key is not configured.']);
+    exit;
+}
+
+$providedKey = (string)($_SERVER['HTTP_X_API_KEY'] ?? $_GET['key'] ?? '');
+if ($providedKey === '' || !hash_equals($apiKey, $providedKey)) {
     http_response_code(401);
     echo json_encode(['ok' => false, 'error' => 'unauthorized']);
     exit;
 }
 
-$raw = file_get_contents('php://input');
-$data = json_decode($raw, true);
-if (!is_array($data)) $data = $_POST;
-
-$action = $data['action'] ?? 'status';
-$site = strtolower(trim($data['site'] ?? 'tonpick'));
-$user = trim($data['username'] ?? '');
-
-if ($user === '') {
-    echo json_encode(['ok' => false, 'error' => 'username required']);
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    header('Allow: POST, OPTIONS');
+    echo json_encode(['ok' => false, 'error' => 'POST required']);
     exit;
 }
 
 try {
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        $data = $_POST;
+    }
+
+    $action = strtolower(trim((string)($data['action'] ?? 'status')));
+    $site = strtolower(trim((string)($data['site'] ?? 'tonpick')));
+    $username = trim((string)($data['username'] ?? ''));
+
+    if ($site === '' || !preg_match('/^[a-z0-9_-]{1,32}$/', $site)) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Invalid site']);
+        exit;
+    }
+    if ($username === '' || strlen($username) > 128) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'username required (max 128 characters)']);
+        exit;
+    }
+
+    $pdo = Database::pdo();
     Database::ensureSchema();
 
+    $select = $pdo->prepare('SELECT * FROM accounts WHERE site = ? AND username = ? ORDER BY id LIMIT 1');
+    $select->execute([$site, $username]);
+    $previous = $select->fetch() ?: [];
+
+    if (!in_array($action, ['claim', 'fail', 'status', 'heartbeat'], true)) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'unknown action']);
+        exit;
+    }
+
+    $now = date('Y-m-d H:i:s');
+    $nextAt = $previous['next_claim_at'] ?? null;
     if ($action === 'claim') {
-        // bot stats ni o'zi yuboradi yoki +1
-        $st = Database::pdo()->prepare('SELECT * FROM accounts WHERE site=? AND username=?');
-        $st->execute([$site, $user]);
-        $prev = $st->fetch() ?: [];
+        $nextSeconds = max(60, min(604800, (int)($data['next_claim_seconds'] ?? 3600)));
+        $nextAt = date('Y-m-d H:i:s', time() + $nextSeconds);
+    } elseif (isset($data['next_claim_seconds'])) {
+        $nextAt = date('Y-m-d H:i:s', time() + max(0, min(604800, (int)$data['next_claim_seconds'])));
+    } elseif (isset($data['next_claim_at'])) {
+        $nextAt = (string)$data['next_claim_at'];
+    }
 
-        $claimsToday = isset($data['claims_today']) ? (int)$data['claims_today'] : ((int)($prev['claims_today'] ?? 0) + 1);
-        $total = isset($data['total_claims']) ? (int)$data['total_claims'] : ((int)($prev['total_claims'] ?? 0) + 1);
-        $nextSec = (int)($data['next_claim_seconds'] ?? 3600);
-        $nextAt = date('Y-m-d H:i:s', time() + max(60, $nextSec));
+    $claims = (int)($data['claims_today'] ?? ((int)($previous['claims_today'] ?? 0) + ($action === 'claim' ? 1 : 0)));
+    $fails = (int)($data['fails_today'] ?? ((int)($previous['fails_today'] ?? 0) + ($action === 'fail' ? 1 : 0)));
+    $total = (int)($data['total_claims'] ?? ((int)($previous['total_claims'] ?? 0) + ($action === 'claim' ? 1 : 0)));
 
-        $id = Database::upsertAccount([
+    $status = (string)($data['status'] ?? (
+        $action === 'claim' ? 'waiting' : ($action === 'fail' ? 'error' : 'running')
+    ));
+    $accountId = Database::upsertAccount([
+        'site' => $site,
+        'username' => $username,
+        'label' => $data['label'] ?? ($previous['label'] ?? ''),
+        'balance' => $data['balance'] ?? ($previous['balance'] ?? '0'),
+        'last_captcha' => $data['captcha'] ?? ($previous['last_captcha'] ?? ''),
+        'last_claim_at' => $action === 'claim' ? $now : ($previous['last_claim_at'] ?? null),
+        'next_claim_at' => $nextAt,
+        'claims_today' => max(0, $claims),
+        'fails_today' => max(0, $fails),
+        'total_claims' => max(0, $total),
+        'status' => $status,
+        'last_message' => $data['message'] ?? ($previous['last_message'] ?? ''),
+        'api_balance' => $data['api_balance'] ?? ($previous['api_balance'] ?? ''),
+    ]);
+
+    if (in_array($action, ['claim', 'fail'], true)) {
+        Database::addEvent($accountId, [
             'site' => $site,
-            'username' => $user,
-            'label' => $data['label'] ?? null,
-            'balance' => $data['balance'] ?? null,
-            'last_captcha' => $data['captcha'] ?? null,
-            'last_claim_at' => date('Y-m-d H:i:s'),
-            'next_claim_at' => $nextAt,
-            'claims_today' => $claimsToday,
-            'fails_today' => isset($data['fails_today']) ? (int)$data['fails_today'] : ($prev['fails_today'] ?? 0),
-            'total_claims' => $total,
-            'status' => 'waiting',
-            'last_message' => $data['message'] ?? 'Claim OK',
-            'api_balance' => $data['api_balance'] ?? null,
-        ]);
-        Database::addEvent($id, [
-            'site' => $site, 'username' => $user,
-            'event_type' => 'claim',
+            'username' => $username,
+            'event_type' => $action,
             'captcha' => $data['captcha'] ?? '',
-            'message' => $data['message'] ?? 'Claim OK',
+            'message' => $data['message'] ?? ($action === 'claim' ? 'Claim OK' : 'Claim failed'),
             'balance' => $data['balance'] ?? '',
         ]);
-        echo json_encode(['ok' => true, 'id' => $id, 'next_claim_at' => $nextAt]);
-        exit;
     }
 
-    if ($action === 'fail') {
-        $st = Database::pdo()->prepare('SELECT * FROM accounts WHERE site=? AND username=?');
-        $st->execute([$site, $user]);
-        $prev = $st->fetch() ?: [];
-        $fails = isset($data['fails_today']) ? (int)$data['fails_today'] : ((int)($prev['fails_today'] ?? 0) + 1);
-        $id = Database::upsertAccount([
-            'site' => $site,
-            'username' => $user,
-            'balance' => $data['balance'] ?? null,
-            'fails_today' => $fails,
-            'claims_today' => $prev['claims_today'] ?? 0,
-            'total_claims' => $prev['total_claims'] ?? 0,
-            'status' => 'error',
-            'last_message' => $data['message'] ?? 'fail',
-            'last_captcha' => $data['captcha'] ?? null,
-        ]);
-        Database::addEvent($id, [
-            'site' => $site, 'username' => $user,
-            'event_type' => 'fail',
-            'captcha' => $data['captcha'] ?? '',
-            'message' => $data['message'] ?? 'fail',
-            'balance' => $data['balance'] ?? '',
-        ]);
-        echo json_encode(['ok' => true, 'id' => $id]);
-        exit;
-    }
-
-    if ($action === 'status' || $action === 'heartbeat') {
-        $nextAt = null;
-        if (!empty($data['next_claim_seconds'])) {
-            $nextAt = date('Y-m-d H:i:s', time() + (int)$data['next_claim_seconds']);
-        } elseif (!empty($data['next_claim_at'])) {
-            $nextAt = $data['next_claim_at'];
-        }
-        $st = Database::pdo()->prepare('SELECT * FROM accounts WHERE site=? AND username=?');
-        $st->execute([$site, $user]);
-        $prev = $st->fetch() ?: [];
-        $id = Database::upsertAccount([
-            'site' => $site,
-            'username' => $user,
-            'label' => $data['label'] ?? null,
-            'balance' => $data['balance'] ?? null,
-            'next_claim_at' => $nextAt,
-            'claims_today' => $data['claims_today'] ?? ($prev['claims_today'] ?? 0),
-            'fails_today' => $data['fails_today'] ?? ($prev['fails_today'] ?? 0),
-            'total_claims' => $data['total_claims'] ?? ($prev['total_claims'] ?? 0),
-            'status' => $data['status'] ?? 'running',
-            'last_message' => $data['message'] ?? null,
-            'api_balance' => $data['api_balance'] ?? null,
-            'last_captcha' => $data['captcha'] ?? null,
-        ]);
-        echo json_encode(['ok' => true, 'id' => $id]);
-        exit;
-    }
-
-    echo json_encode(['ok' => false, 'error' => 'unknown action']);
+    echo json_encode([
+        'ok' => true,
+        'id' => $accountId,
+        'action' => $action,
+        'next_claim_at' => $nextAt,
+    ], JSON_UNESCAPED_UNICODE);
 } catch (Throwable $e) {
+    error_log('[PickDash api.php] ' . get_class($e) . ': ' . $e->getMessage());
     http_response_code(500);
-    echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
+    echo json_encode([
+        'ok' => false,
+        'error' => 'Server yoki ma’lumotlar bazasi xatosi. Render Logs bo‘limini tekshiring.',
+    ], JSON_UNESCAPED_UNICODE);
 }
