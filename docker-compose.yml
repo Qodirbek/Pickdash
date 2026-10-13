@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  dash:
+    build: .
+    ports:
+      - "8080:80"
+    environment:
+      DASH_API_KEY: pickdash-secret-change-me
+      # DATABASE_URL: postgresql://user:pass@host:5432/db   # Render Postgres
+      SQLITE_PATH: /var/www/html/data/pickdash.sqlite
+    volumes:
+      - dash_data:/var/www/html/data
+volumes:
+  dash_data:
